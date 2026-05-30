@@ -1,5 +1,13 @@
 # Changelog
 
+## \[0.56.0]
+
+- [`145b36f`](https://github.com/tauri-apps/wry/commit/145b36fb5e3551851a9afbdf9c34154e2388f85d) ([#1736](https://github.com/tauri-apps/wry/pull/1736)) Remove Send, Sync bounds from NewWindowOpener.
+- [`9d0a9fe`](https://github.com/tauri-apps/wry/commit/9d0a9fe31321797b2fb4dd83e01408df9d7fedcc) ([#1712](https://github.com/tauri-apps/wry/pull/1712)) On Windows, Add `WebViewExtWindows::hwnd` getter to access the child HWND containing the webview.
+- [`5bdda32`](https://github.com/tauri-apps/wry/commit/5bdda323937c01e497a9735ce83a3636202a8a6a) ([#1719](https://github.com/tauri-apps/wry/pull/1719)) On macOS, avoid an extra copy for owned custom protocol response bodies by transferring the body buffer into `NSData`.
+- [`86ac6e8`](https://github.com/tauri-apps/wry/commit/86ac6e8891be99efa21756d751573bcbaa22554c) ([#1732](https://github.com/tauri-apps/wry/pull/1732)) Updated `dom_query` dependency to 0.28.0
+- [`10fdf73`](https://github.com/tauri-apps/wry/commit/10fdf7308013d40741990c60e960cf82b18d9372) ([#1738](https://github.com/tauri-apps/wry/pull/1738)) On Windows, add `WebViewBuilderExtWindows::with_profile_name` to opt the webview into a named WebView2 profile. Webviews with different profile names within the same environment have isolated cookies, storage, IndexedDB, and cache while sharing the runtime — matching WebView2's documented multi-profile pattern.
+
 ## \[0.55.1]
 
 - [`3860359`](https://github.com/tauri-apps/wry/commit/3860359e3dc75260fb9865f7a8eae00a9ec4733d) ([#1721](https://github.com/tauri-apps/wry/pull/1721) by [@lucasfernog](https://github.com/tauri-apps/wry/../../lucasfernog)) Tweak ProGuard rules to keep the getId required activity method.
