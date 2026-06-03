@@ -16,7 +16,6 @@ use std::{
 /// private/incognito tabs.
 ///
 /// # Warning
-///
 /// If [`WebView`] is created by a WebContext. Dropping `WebContext` will cause [`WebView`] lose
 /// some actions like custom protocol on Mac. Please keep both instances when you still wish to
 /// interact with them.
@@ -25,23 +24,16 @@ use std::{
 #[derive(Debug)]
 pub struct WebContext {
   data_directory: Option<PathBuf>,
-  #[allow(dead_code)] // It's not needed on Windows and macOS.
   pub(crate) os: WebContextImpl,
-  #[allow(dead_code)] // It's not needed on Windows and macOS.
   pub(crate) custom_protocols: HashSet<String>,
 }
 
 impl WebContext {
   /// Create a new [`WebContext`].
   ///
-  /// - `data_directory`: Whether the WebView window should have a custom user data path.
-  ///   This is useful in Windows when a bundled application can't have the webview data inside `Program Files`.
-  ///
-  /// ## Platform-specific:
-  ///
-  /// - **Windows**: Webview instances with different `CoreWebView2EnvironmentOptions` must have different `data_directory`s [^1]
-  ///
-  /// [^1]: <https://learn.microsoft.com/en-us/dotnet/api/microsoft.web.webview2.core.corewebview2environment.createcorewebview2controllerasync?view=webview2-dotnet-1.0.3719.77#:~:text=WebView%20creation%20fails%20if%20a%20running%20instance%20using%20the%20same%20user%20data%20folder%20exists%2C%20and%20the%20Environment%20objects%20have%20different%20CoreWebView2EnvironmentOptions.>
+  /// `data_directory`:
+  /// * Whether the WebView window should have a custom user data path. This is useful in Windows
+  ///   when a bundled application can't have the webview data inside `Program Files`.
   pub fn new(data_directory: Option<PathBuf>) -> Self {
     Self {
       os: WebContextImpl::new(data_directory.as_deref()),

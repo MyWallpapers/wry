@@ -24,6 +24,10 @@ class RustWebView(context: Context, val initScripts: Array<String>, val id: Stri
         settings.databaseEnabled = true
         settings.mediaPlaybackRequiresUserGesture = false
         settings.javaScriptCanOpenWindowsAutomatically = true
+        settings.allowFileAccess = false
+        settings.allowContentAccess = false
+        settings.allowFileAccessFromFileURLs = false
+        settings.allowUniversalAccessFromFileURLs = false
 
         if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
             isDocumentStartScriptEnabled = true
@@ -50,13 +54,13 @@ class RustWebView(context: Context, val initScripts: Array<String>, val id: Stri
     }
 
     override fun loadUrl(url: String) {
-        if (!Rust.shouldOverride(id, url)) {
+        if (!shouldOverride(url)) {
             super.loadUrl(url);
         }
     }
 
     override fun loadUrl(url: String, additionalHttpHeaders: Map<String, String>) {
-        if (!Rust.shouldOverride(id, url)) {
+        if (!shouldOverride(url)) {
             super.loadUrl(url, additionalHttpHeaders);
         }
     }
@@ -70,7 +74,7 @@ class RustWebView(context: Context, val initScripts: Array<String>, val id: Stri
     fun evalScript(id: Int, script: String) {
         post {
             super.evaluateJavascript(script) { result ->
-                Rust.onEval(this.id, id, result)
+                onEval(id, result)
             }
         }
     }
@@ -91,6 +95,9 @@ class RustWebView(context: Context, val initScripts: Array<String>, val id: Stri
         val cookieManager = CookieManager.getInstance()
         return cookieManager.getCookie(url)
     }
+
+    private external fun shouldOverride(url: String): Boolean
+    private external fun onEval(id: Int, result: String)
 
     {{class-extension}}
 }

@@ -25,12 +25,9 @@ use crate::{NewWindowFeatures, NewWindowResponse, WryWebView};
 
 #[cfg(target_os = "macos")]
 struct NewWindow {
-  #[allow(dead_code)]
-  ns_window: Retained<objc2_app_kit::NSWindow>,
-  #[allow(dead_code)]
-  webview: Retained<objc2_web_kit::WKWebView>,
-  #[allow(dead_code)]
-  delegate: Retained<WryNSWindowDelegate>,
+  _ns_window: Retained<objc2_app_kit::NSWindow>,
+  _webview: Retained<objc2_web_kit::WKWebView>,
+  _delegate: Retained<WryNSWindowDelegate>,
 }
 
 // SAFETY: we are not using the new window at all, just dropping it on another thread
@@ -54,6 +51,7 @@ struct WryNSWindowDelegateIvars {
 #[cfg(target_os = "macos")]
 define_class!(
   #[unsafe(super(NSObject))]
+  #[name = "WryNSWindowDelegate"]
   #[thread_kind = MainThreadOnly]
   #[ivars = WryNSWindowDelegateIvars]
   struct WryNSWindowDelegate;
@@ -81,13 +79,15 @@ impl WryNSWindowDelegate {
 
 pub struct WryWebViewUIDelegateIvars {
   #[cfg(target_os = "macos")]
-  new_window_req_handler: Option<Box<dyn Fn(String, NewWindowFeatures) -> NewWindowResponse>>,
+  new_window_req_handler:
+    Option<Box<dyn Fn(String, NewWindowFeatures) -> NewWindowResponse + Send>>,
   #[cfg(target_os = "macos")]
   new_windows: Rc<RefCell<Vec<NewWindow>>>,
 }
 
 define_class!(
   #[unsafe(super(NSObject))]
+  #[name = "WryWebViewUIDelegate"]
   #[thread_kind = MainThreadOnly]
   #[ivars = WryWebViewUIDelegateIvars]
   pub struct WryWebViewUIDelegate;
@@ -233,9 +233,10 @@ define_class!(
             let delegate = WryNSWindowDelegate::new(
               mtm,
               Box::new(move || {
+                let new_windows = new_windows.clone();
                 new_windows
                   .borrow_mut()
-                  .retain(|window| Retained::as_ptr(&window.ns_window) as usize != window_id);
+                  .retain(|window| Retained::as_ptr(&window._ns_window) as usize != window_id);
               }),
             );
             window.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*delegate)));
@@ -244,9 +245,9 @@ define_class!(
             window.makeKeyAndOrderFront(None);
 
             self.ivars().new_windows.borrow_mut().push(NewWindow {
-              ns_window: window,
-              webview: webview.clone(),
-              delegate,
+              _ns_window: window,
+              _webview: webview.clone(),
+              _delegate: delegate,
             });
 
             Some(webview)
@@ -264,7 +265,9 @@ define_class!(
 impl WryWebViewUIDelegate {
   pub fn new(
     mtm: MainThreadMarker,
-    new_window_req_handler: Option<Box<dyn Fn(String, NewWindowFeatures) -> NewWindowResponse>>,
+    new_window_req_handler: Option<
+      Box<dyn Fn(String, NewWindowFeatures) -> NewWindowResponse + Send>,
+    >,
   ) -> Retained<Self> {
     #[cfg(target_os = "ios")]
     let _new_window_req_handler = new_window_req_handler;

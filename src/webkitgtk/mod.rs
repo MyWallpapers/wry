@@ -64,6 +64,28 @@ mod drag_drop;
 mod synthetic_mouse_events;
 mod web_context;
 
+fn run_javascript_without_result(webview: &WebView, script: &str) {
+  let cancellable: Option<&Cancellable> = None;
+  webview.run_javascript(script, cancellable, |_| ());
+}
+
+fn run_javascript_to_json<F>(webview: &WebView, script: &str, callback: F)
+where
+  F: FnOnce(String) + 'static,
+{
+  let cancellable: Option<&Cancellable> = None;
+  webview.run_javascript(script, cancellable, move |result| {
+    let result = result
+      .ok()
+      .and_then(|result| result.js_value())
+      .and_then(|value| value.to_json(0))
+      .unwrap_or_default()
+      .to_string();
+
+    callback(result);
+  });
+}
+
 #[cfg(feature = "x11")]
 struct X11Data {
   is_child: bool,
@@ -292,10 +314,7 @@ impl InnerWebView {
       // background color
       if let Some((red, green, blue, alpha)) = attributes.background_color {
         webview.set_background_color(&gtk::gdk::RGBA::new(
-          red as f64 / 255.0,
-          green as f64 / 255.0,
-          blue as f64 / 255.0,
-          alpha as f64 / 255.0,
+          red as _, green as _, blue as _, alpha as _,
         ));
       }
     }
@@ -354,9 +373,8 @@ impl InnerWebView {
       if let LoadEvent::Committed = event {
         let mut pending_scripts_ = pending_scripts.lock().unwrap();
         if let Some(pending_scripts) = pending_scripts_.take() {
-          let cancellable: Option<&Cancellable> = None;
           for script in pending_scripts {
-            webview.run_javascript(&script, cancellable, |_| ());
+            run_javascript_without_result(webview, &script);
           }
         }
       }
@@ -694,22 +712,14 @@ impl InnerWebView {
     if let Some(pending_scripts) = &mut *self.pending_scripts.lock().unwrap() {
       pending_scripts.push(js.into());
     } else {
-      let cancellable: Option<&Cancellable> = None;
-
       #[cfg(feature = "tracing")]
       let span = SendEnteredSpan(tracing::debug_span!("wry::eval").entered());
 
-      self.webview.run_javascript(js, cancellable, |result| {
+      run_javascript_to_json(&self.webview, js, move |result| {
         #[cfg(feature = "tracing")]
         drop(span);
 
         if let Some(callback) = callback {
-          let result = result
-            .map(|r| r.js_value().and_then(|js| js.to_json(0)))
-            .unwrap_or_default()
-            .unwrap_or_default()
-            .to_string();
-
           callback(result);
         }
       });
@@ -766,10 +776,7 @@ impl InnerWebView {
 
   pub fn set_background_color(&self, (red, green, blue, alpha): RGBA) -> Result<()> {
     self.webview.set_background_color(&gtk::gdk::RGBA::new(
-      red as f64 / 255.0,
-      green as f64 / 255.0,
-      blue as f64 / 255.0,
-      alpha as f64 / 255.0,
+      red as _, green as _, blue as _, alpha as _,
     ));
     Ok(())
   }

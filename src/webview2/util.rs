@@ -18,6 +18,42 @@ use windows::{
   },
 };
 
+/// WebView2 supports non-standard protocols only on Windows 10+, so we have to use a workaround,
+/// converting `{protocol}://localhost/abc` to `{http_or_https}://{protocol}.localhost/abc`,
+/// and this function tests if the URI starts with `{http_or_https}://{protocol}.`
+///
+/// See https://github.com/MicrosoftEdge/WebView2Feedback/issues/73
+pub(super) fn is_work_around_uri(uri: &str, http_or_https: &str, protocol: &str) -> bool {
+  uri
+    .strip_prefix(http_or_https)
+    .and_then(|rest| rest.strip_prefix("://"))
+    .and_then(|rest| rest.strip_prefix(protocol))
+    .and_then(|rest| rest.strip_prefix("."))
+    .is_some()
+}
+
+pub(super) fn apply_uri_work_around(uri: &str, http_or_https: &str, protocol: &str) -> String {
+  uri.replace(
+    &original_uri_prefix(protocol),
+    &work_around_uri_prefix(http_or_https, protocol),
+  )
+}
+
+pub(super) fn revert_uri_work_around(uri: &str, http_or_https: &str, protocol: &str) -> String {
+  uri.replace(
+    &work_around_uri_prefix(http_or_https, protocol),
+    &original_uri_prefix(protocol),
+  )
+}
+
+fn original_uri_prefix(protocol: &str) -> String {
+  format!("{protocol}://")
+}
+
+pub(super) fn work_around_uri_prefix(http_or_https: &str, protocol: &str) -> String {
+  format!("{http_or_https}://{protocol}.")
+}
+
 fn get_function_impl(library: &str, function: &str) -> FARPROC {
   let library = HSTRING::from(library);
   assert_eq!(function.chars().last(), Some('\0'));
@@ -54,6 +90,26 @@ static GET_DPI_FOR_MONITOR: Lazy<Option<GetDpiForMonitor>> =
 pub const BASE_DPI: u32 = 96;
 pub fn dpi_to_scale_factor(dpi: u32) -> f64 {
   dpi as f64 / BASE_DPI as f64
+}
+
+#[inline]
+pub(super) fn is_windows_7() -> bool {
+  let v = windows_version::OsVersion::current();
+  // windows 7 is 6.1
+  v.major == 6 && v.minor == 1
+}
+
+pub(super) struct UnsafeSend<T>(T);
+unsafe impl<T> Send for UnsafeSend<T> {}
+
+impl<T> UnsafeSend<T> {
+  pub(super) fn new(value: T) -> Self {
+    Self(value)
+  }
+
+  pub(super) fn take(self) -> T {
+    self.0
+  }
 }
 
 #[allow(non_snake_case)]
@@ -97,5 +153,18 @@ pub unsafe fn hwnd_dpi(hwnd: HWND) -> u32 {
       // application and the WM.
       BASE_DPI
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::is_work_around_uri;
+
+  #[test]
+  fn checks_if_custom_protocol_uri() {
+    let scheme = "http";
+    let uri = "http://wry.localhost/path/to/page";
+    assert!(is_work_around_uri(uri, scheme, "wry"));
+    assert!(!is_work_around_uri(uri, scheme, "asset"));
   }
 }

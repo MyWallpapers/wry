@@ -20,18 +20,21 @@ use windows::{
   Win32::{
     Foundation::*,
     Globalization::*,
-    Graphics::Gdi::*,
-    System::{Com::*, LibraryLoader::GetModuleHandleW},
+    Graphics::{DirectComposition::*, Gdi::*},
+    System::{Com::*, LibraryLoader::GetModuleHandleW, Threading::GetCurrentThreadId},
     UI::{Input::KeyboardAndMouse::SetFocus, Shell::*, WindowsAndMessaging::*},
   },
 };
 
 use self::drag_drop::DragDropController;
+use self::util::{
+  apply_uri_work_around, is_windows_7, is_work_around_uri, revert_uri_work_around,
+  work_around_uri_prefix, UnsafeSend,
+};
 use super::Theme;
 use crate::{
-  custom_protocol_workaround, proxy::ProxyConfig, Error, MemoryUsageLevel, NewWindowFeatures,
-  NewWindowOpener, NewWindowResponse, PageLoadEvent, Rect, RequestAsyncResponder, Result,
-  WebViewAttributes, RGBA,
+  proxy::ProxyConfig, Error, MemoryUsageLevel, NewWindowFeatures, NewWindowOpener,
+  NewWindowResponse, PageLoadEvent, Rect, RequestAsyncResponder, Result, WebViewAttributes, RGBA,
 };
 
 type EventRegistrationToken = i64;
@@ -61,17 +64,51 @@ pub(crate) struct InnerWebView {
   pub controller: ICoreWebView2Controller,
   pub webview: ICoreWebView2,
   pub env: ICoreWebView2Environment,
+  /// Composition controller for SendMouseInput (only set in composition mode)
+  pub composition_controller: Option<ICoreWebView2CompositionController>,
+  /// Keep DirectComposition objects alive (dropped with the webview)
+  _dcomp_state: Option<DCompState>,
   // Store FileDropController in here to make sure it gets dropped when
   // the webview gets dropped, otherwise we'll have a memory leak
-  #[allow(dead_code)]
-  drag_drop_controller: Option<DragDropController>,
+  _drag_drop_controller: Option<DragDropController>,
+}
+
+/// DirectComposition state — kept alive as long as the webview exists
+struct DCompState {
+  _device: IDCompositionDevice,
+  _target: IDCompositionTarget,
+  _visual: IDCompositionVisual,
+}
+
+/// Result of controller creation — may include a composition controller
+struct ControllerResult {
+  controller: ICoreWebView2Controller,
+  composition_controller: Option<ICoreWebView2CompositionController>,
+  dcomp_state: Option<DCompState>,
 }
 
 impl Drop for InnerWebView {
   fn drop(&mut self) {
+    if let Some(comp_controller) = self.composition_controller.as_ref() {
+      crate::clear_composition_controller_ptr_for_hwnd_raw(
+        self.hwnd.0 as isize,
+        comp_controller.as_raw() as isize,
+      );
+    }
     let _ = unsafe { self.controller.Close() };
     if self.is_child {
-      let _ = unsafe { DestroyWindow(self.hwnd) };
+      let owner_thread = unsafe { GetWindowThreadProcessId(self.hwnd, None) };
+      let current_thread = unsafe { GetCurrentThreadId() };
+      if owner_thread == current_thread {
+        let _ = unsafe { DestroyWindow(self.hwnd) };
+      } else {
+        let hwnd = self.hwnd;
+        unsafe {
+          Self::dispatch_handler(hwnd, move || {
+            let _ = DestroyWindow(hwnd);
+          });
+        }
+      }
     }
     unsafe { Self::dettach_parent_subclass(*self.parent.borrow()) }
   }
@@ -135,14 +172,21 @@ impl InnerWebView {
     } else {
       Self::create_environment(&attributes, pl_attrs.clone())?
     };
-    let controller = Self::create_controller(hwnd, &env, attributes.incognito, background_color)?;
+    let composition_mode = pl_attrs.composition_mode;
+    let cr = Self::create_controller(
+      hwnd,
+      &env,
+      attributes.incognito,
+      background_color,
+      composition_mode,
+    )?;
     let webview = Self::init_webview(
       parent,
       hwnd,
       id.clone(),
       attributes,
       &env,
-      &controller,
+      &cr.controller,
       pl_attrs,
       is_child,
     )?;
@@ -150,9 +194,10 @@ impl InnerWebView {
     let drag_drop_controller = drop_handler.map(|handler| {
       // Disable file drops, so our handler can capture it
       unsafe {
-        let _ = controller
+        let _ = cr
+          .controller
           .cast::<ICoreWebView2Controller4>()
-          .and_then(|c| c.SetAllowExternalDrop(false));
+          .and_then(|c: ICoreWebView2Controller4| c.SetAllowExternalDrop(false));
       }
       DragDropController::new(hwnd, handler)
     });
@@ -161,11 +206,13 @@ impl InnerWebView {
       id,
       parent: RefCell::new(parent),
       hwnd,
-      controller,
+      controller: cr.controller,
       is_child,
       webview,
       env,
-      drag_drop_controller,
+      composition_controller: cr.composition_controller,
+      _dcomp_state: cr.dcomp_state,
+      _drag_drop_controller: drag_drop_controller,
     };
 
     if is_child {
@@ -294,6 +341,7 @@ impl InnerWebView {
     let additional_browser_args = pl_attrs.additional_browser_args.unwrap_or_else(|| {
       // remove "mini menu" - See https://github.com/tauri-apps/wry/issues/535
       // and "smart screen" - See https://github.com/tauri-apps/tauri/issues/1345
+      // enable white flicker fix
       let default_args = "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection";
       let mut arguments = String::from(default_args);
 
@@ -349,18 +397,15 @@ impl InnerWebView {
         // by manually creating the callback handler and use webview2_com::with_with_bump
         &CreateCoreWebView2EnvironmentCompletedHandler::create(Box::new(
           move |error_code, environment| {
-            let result = (|| {
-              error_code?;
-              environment.ok_or_else(|| windows::core::Error::from(E_POINTER).into())
-            })();
-            tx.send(result)
+            error_code?;
+            tx.send(environment.ok_or_else(|| windows::core::Error::from(E_POINTER)))
               .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
           },
         )),
       )?;
     }
 
-    webview2_com::wait_with_pump(rx)?
+    webview2_com::wait_with_pump(rx)?.map_err(Into::into)
   }
 
   #[inline]
@@ -369,25 +414,26 @@ impl InnerWebView {
     env: &ICoreWebView2Environment,
     incognito: bool,
     background_color: Option<(u8, u8, u8, u8)>,
-  ) -> Result<ICoreWebView2Controller> {
-    let (tx, rx) = mpsc::channel();
+    composition_mode: bool,
+  ) -> Result<ControllerResult> {
+    if composition_mode {
+      return Self::create_composition_controller(hwnd, env, incognito, background_color);
+    }
 
-    // we don't use CreateCoreWebView2ControllerCompletedHandler::wait_for_async
-    // as it uses an mspc::channel under the hood, so we can avoid using two channels
-    // by manually creating the callback handler and use webview2_com::with_with_bump
+    let (tx, rx) = mpsc::channel();
+    let env = env.clone();
+    let env10 = env.cast::<ICoreWebView2Environment10>();
+
     let handler = CreateCoreWebView2ControllerCompletedHandler::create(Box::new(
       move |error_code, controller| {
-        let result = (|| {
-          error_code?;
-          controller.ok_or_else(|| windows::core::Error::from(E_POINTER).into())
-        })();
-        tx.send(result)
+        error_code?;
+        tx.send(controller.ok_or_else(|| windows::core::Error::from(E_POINTER)))
           .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
       },
     ));
 
     unsafe {
-      if let Ok(env10) = env.cast::<ICoreWebView2Environment10>() {
+      if let Ok(env10) = env10 {
         let controller_opts = env10.CreateCoreWebView2ControllerOptions()?;
 
         if let Some((r, g, b, mut a)) = background_color {
@@ -411,7 +457,111 @@ impl InnerWebView {
       }
     }
 
-    webview2_com::wait_with_pump(rx)?
+    let controller = webview2_com::wait_with_pump(rx)?.map_err(Into::<crate::Error>::into)?;
+    Ok(ControllerResult {
+      controller,
+      composition_controller: None,
+      dcomp_state: None,
+    })
+  }
+
+  /// Create a WebView2 composition controller with DirectComposition visual tree.
+  /// This enables SendMouseInput for direct input injection.
+  fn create_composition_controller(
+    hwnd: HWND,
+    env: &ICoreWebView2Environment,
+    _incognito: bool,
+    _background_color: Option<(u8, u8, u8, u8)>,
+  ) -> Result<ControllerResult> {
+    let env3: ICoreWebView2Environment3 = env
+      .cast()
+      .map_err(|e| crate::Error::WebView2Error(webview2_com::Error::WindowsError(e)))?;
+
+    let (tx, rx) = mpsc::channel();
+
+    let handler = CreateCoreWebView2CompositionControllerCompletedHandler::create(Box::new(
+      move |error_code, controller| {
+        error_code?;
+        tx.send(controller.ok_or_else(|| windows::core::Error::from(E_POINTER)))
+          .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
+      },
+    ));
+
+    unsafe {
+      env3.CreateCoreWebView2CompositionController(hwnd, &handler)?;
+    }
+
+    let comp_controller: ICoreWebView2CompositionController =
+      webview2_com::wait_with_pump(rx)?.map_err(Into::<crate::Error>::into)?;
+
+    // Publish the raw COM pointer on the owning HWND so host code can resolve it
+    // without a cross-window global slot.
+    {
+      use windows::core::Interface;
+      let ptr = comp_controller.as_raw() as isize;
+      crate::store_composition_controller_ptr_for_hwnd_raw(ptr, hwnd.0 as isize);
+    }
+
+    // The composition controller implements ICoreWebView2Controller
+    let controller: ICoreWebView2Controller = comp_controller
+      .cast()
+      .map_err(|e| crate::Error::WebView2Error(webview2_com::Error::WindowsError(e)))?;
+
+    // Set up DirectComposition visual tree for rendering
+    let dcomp_state = unsafe { Self::setup_dcomp(hwnd, &comp_controller)? };
+
+    Ok(ControllerResult {
+      controller,
+      composition_controller: Some(comp_controller),
+      dcomp_state: Some(dcomp_state),
+    })
+  }
+
+  /// Set up DirectComposition visual tree and bind it to the composition controller.
+  unsafe fn setup_dcomp(
+    hwnd: HWND,
+    comp_controller: &ICoreWebView2CompositionController,
+  ) -> Result<DCompState> {
+    use windows::core::Interface as _;
+
+    // Create DirectComposition device (no D3D device needed for basic compositing)
+    let device: IDCompositionDevice = DCompositionCreateDevice2(None)
+      .map_err(|e| crate::Error::WebView2Error(webview2_com::Error::WindowsError(e)))?;
+
+    // Create composition target bound to our HWND
+    let target = device
+      .CreateTargetForHwnd(hwnd, true)
+      .map_err(|e| crate::Error::WebView2Error(webview2_com::Error::WindowsError(e)))?;
+
+    // Create the root visual
+    let visual = device
+      .CreateVisual()
+      .map_err(|e| crate::Error::WebView2Error(webview2_com::Error::WindowsError(e)))?;
+
+    // Set visual as root of the composition target
+    target
+      .SetRoot(&visual)
+      .map_err(|e| crate::Error::WebView2Error(webview2_com::Error::WindowsError(e)))?;
+
+    // Bind the visual to the WebView2 composition controller
+    // put_RootVisualTarget takes IUnknown — the visual implements it
+    let visual_unknown: windows::core::IUnknown = visual
+      .cast()
+      .map_err(|e| crate::Error::WebView2Error(webview2_com::Error::WindowsError(e)))?;
+    comp_controller
+      .SetRootVisualTarget(&visual_unknown)
+      .map_err(|e| crate::Error::WebView2Error(webview2_com::Error::WindowsError(e)))?;
+
+    // Commit the composition
+    device
+      .Commit()
+      .map_err(|e| crate::Error::WebView2Error(webview2_com::Error::WindowsError(e)))?;
+
+    Ok(DCompState {
+      _device: device,
+      _target: target,
+      _visual: visual,
+    })
   }
 
   #[allow(clippy::too_many_arguments)]
@@ -520,7 +670,7 @@ impl InnerWebView {
         if custom_protocols.contains(protocol) {
           // WebView2 supports non-standard protocols only on Windows 10+, so we have to use this workaround
           // See https://github.com/MicrosoftEdge/WebView2Feedback/issues/73
-          url = custom_protocol_workaround::apply_uri_work_around(&url, http_or_https, protocol)
+          url = apply_uri_work_around(&url, http_or_https, protocol)
         }
       }
 
@@ -696,7 +846,7 @@ impl InnerWebView {
     let new_window_req_handler = attributes
       .new_window_req_handler
       .take()
-      .map(std::rc::Rc::new);
+      .map(|handler| std::sync::Arc::new(std::sync::Mutex::new(handler)));
     let env_ = env.clone();
     // New window handler
     webview.add_NewWindowRequested(
@@ -760,22 +910,32 @@ impl InnerWebView {
 
           let new_window_req_handler = new_window_req_handler.clone();
           let deferral = args.GetDeferral()?;
-          // Use `dispatch_handler` to schedule the run on the message loop after this callback completes,
-          // this is needed for `new_window_req_handler` to create new webviews for `NewWindowResponse::Create`
-          // or it will deadlock, see https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/threading-model#reentrancy
-          Self::dispatch_handler(hwnd, move || match new_window_req_handler(uri, features) {
-            NewWindowResponse::Allow => {
-              let _ = args.SetHandled(false);
-              let _ = deferral.Complete();
-            }
-            NewWindowResponse::Create { webview } => {
-              let _ = args.SetHandled(true);
-              let _ = args.SetNewWindow(&webview);
-              let _ = deferral.Complete();
-            }
-            NewWindowResponse::Deny => {
-              let _ = args.SetHandled(true);
-              let _ = deferral.Complete();
+          let deferral = UnsafeSend::new(deferral);
+          let args = UnsafeSend::new(args);
+          let hwnd = UnsafeSend::new(hwnd.clone());
+          std::thread::spawn(move || {
+            let response = new_window_req_handler
+              .lock()
+              .map(|handler| handler(uri, features))
+              .unwrap_or(NewWindowResponse::Deny);
+
+            match response {
+              NewWindowResponse::Allow => {
+                let _ = args.take().SetHandled(false);
+                let _ = deferral.take().Complete();
+              }
+              NewWindowResponse::Create { webview } => {
+                Self::dispatch_handler(hwnd.take(), move || {
+                  let args = args.take();
+                  let _ = args.SetHandled(true);
+                  let _ = args.SetNewWindow(&webview);
+                  let _ = deferral.take().Complete();
+                });
+              }
+              NewWindowResponse::Deny => {
+                let _ = args.take().SetHandled(true);
+                let _ = deferral.take().Complete();
+              }
             }
           });
         } else {
@@ -786,7 +946,6 @@ impl InnerWebView {
       })),
       token,
     )?;
-    Self::attach_main_thread_dispatcher(hwnd);
 
     // Download handler
     if attributes.download_started_handler.is_some()
@@ -930,7 +1089,7 @@ impl InnerWebView {
     for name in attributes.custom_protocols.keys() {
       // WebView2 supports non-standard protocols only on Windows 10+, so we have to use this workaround
       // See https://github.com/MicrosoftEdge/WebView2Feedback/issues/73
-      let work_around_uri = custom_protocol_workaround::work_around_uri_prefix(http_or_https, name);
+      let work_around_uri = work_around_uri_prefix(http_or_https, name);
       let filter = HSTRING::from(format!("{work_around_uri}*"));
 
       // If WebView2 version is high enough, use the new API to add the filter to allow Shared Workers and
@@ -976,7 +1135,7 @@ impl InnerWebView {
 
         if let Some((custom_protocol, custom_protocol_handler)) = custom_protocols
           .iter()
-          .find(|(protocol, _)| custom_protocol_workaround::is_work_around_uri(&uri, http_or_https, protocol))
+          .find(|(protocol, _)| is_work_around_uri(&uri, http_or_https, protocol))
         {
           let request = match Self::prepare_request(http_or_https, custom_protocol, &webview_request, &uri)
           {
@@ -1091,11 +1250,7 @@ impl InnerWebView {
     }
 
     // Undo the protocol workaround when giving path to resolver
-    let path = custom_protocol_workaround::revert_uri_work_around(
-      webview_request_uri,
-      http_or_https,
-      custom_protocol,
-    );
+    let path = revert_uri_work_around(webview_request_uri, http_or_https, custom_protocol);
 
     let request = request.uri(&path).body(body_sent)?;
 
@@ -1142,13 +1297,6 @@ impl InnerWebView {
     env.CreateWebResourceResponse(None, status_code as i32, &status, &error)
   }
 
-  /// Send `function` to run on `hwnd`'s thread
-  ///
-  /// ## SAFETY:
-  ///
-  /// This function doesn't force a `Send` to make it easier to use,
-  /// the caller must call this function on the same thread as `hwnd`
-  /// or ensure the function is safe to send to and called on `hwnd`'s thread
   #[inline]
   unsafe fn dispatch_handler<F>(hwnd: HWND, function: F)
   where
@@ -1170,9 +1318,9 @@ impl InnerWebView {
         err.message()
       );
       #[cfg(feature = "tracing")]
-      tracing::error!("{msg}");
+      tracing::error!("{}", &msg);
       #[cfg(debug_assertions)]
-      eprintln!("{msg}");
+      eprintln!("{}", msg);
     }
   }
 
@@ -1245,7 +1393,7 @@ impl InnerWebView {
               0,
               width,
               height,
-              SWP_ASYNCWINDOWPOS | SWP_NOACTIVATE | SWP_NOZORDER,
+              SWP_NOACTIVATE | SWP_NOZORDER,
             );
           }
         }
@@ -1368,7 +1516,7 @@ impl InnerWebView {
 
 /// Public APIs
 impl InnerWebView {
-  pub fn id(&self) -> crate::WebViewId<'_> {
+  pub fn id(&self) -> crate::WebViewId {
     &self.id
   }
 
@@ -1635,37 +1783,34 @@ impl InnerWebView {
         // as it uses an mspc::channel under the hood, so we can avoid using two channels
         // by manually creating the callback handler and use webview2_com::with_with_bump
         &GetCookiesCompletedHandler::create(Box::new(move |error_code, cookies| {
-          let result = (move || {
-            error_code?;
+          error_code?;
 
-            let cookies = if let Some(cookies) = cookies {
-              let mut count = 0;
-              cookies.Count(&mut count)?;
+          let cookies = if let Some(cookies) = cookies {
+            let mut count = 0;
+            cookies.Count(&mut count)?;
 
-              let mut out = Vec::with_capacity(count as _);
+            let mut out = Vec::with_capacity(count as _);
 
-              for idx in 0..count {
-                let cookie = cookies.GetValueAtIndex(idx)?;
+            for idx in 0..count {
+              let cookie = cookies.GetValueAtIndex(idx)?;
 
-                if let Ok(cookie) = Self::cookie_from_win32(cookie) {
-                  out.push(cookie)
-                }
+              if let Ok(cookie) = Self::cookie_from_win32(cookie) {
+                out.push(cookie)
               }
+            }
 
-              out
-            } else {
-              Vec::new()
-            };
-            Ok(cookies)
-          })();
+            out
+          } else {
+            Vec::new()
+          };
 
-          tx.send(result)
+          tx.send(cookies)
             .map_err(|_| windows::core::Error::from(E_UNEXPECTED))
         })),
       )?;
     }
 
-    webview2_com::wait_with_pump(rx)?
+    webview2_com::wait_with_pump(rx).map_err(Into::into)
   }
 
   pub fn set_cookie(&self, cookie: &cookie::Cookie<'_>) -> Result<()> {
@@ -1844,11 +1989,4 @@ pub fn platform_webview_version() -> Result<String> {
   let mut versioninfo = PWSTR::null();
   unsafe { GetAvailableCoreWebView2BrowserVersionString(PCWSTR::null(), &mut versioninfo) }?;
   Ok(take_pwstr(versioninfo))
-}
-
-#[inline]
-fn is_windows_7() -> bool {
-  let v = windows_version::OsVersion::current();
-  // windows 7 is 6.1
-  v.major == 6 && v.minor == 1
 }

@@ -36,6 +36,7 @@ pub struct WryWebViewIvars {
 
 define_class!(
   #[unsafe(super(WKWebView))]
+  #[name = "WryWebView"]
   #[ivars = WryWebViewIvars]
   pub struct WryWebView;
 

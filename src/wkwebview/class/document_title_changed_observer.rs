@@ -11,7 +11,7 @@ use objc2::{
   AllocAnyThread, DefinedClass,
 };
 use objc2_foundation::{
-  ns_string, NSDictionary, NSKeyValueChangeKey, NSKeyValueObservingOptions,
+  NSDictionary, NSKeyValueChangeKey, NSKeyValueObservingOptions,
   NSObjectNSKeyValueObserverRegistration, NSObjectProtocol, NSString,
 };
 
@@ -23,6 +23,7 @@ pub struct DocumentTitleChangedObserverIvars {
 
 define_class!(
   #[unsafe(super(NSObject))]
+  #[name = "DocumentTitleChangedObserver"]
   #[ivars = DocumentTitleChangedObserverIvars]
   pub struct DocumentTitleChangedObserver;
 
@@ -37,8 +38,8 @@ define_class!(
       _context: *mut c_void,
     ) {
       if let (Some(key_path), Some(object)) = (key_path, of_object) {
-        unsafe {
-          if key_path.isEqualToString(ns_string!("title")) {
+        if key_path.to_string() == "title" {
+          unsafe {
             let handler = &self.ivars().handler;
             // if !handler.is_null() {
             let title: *const NSString = msg_send![object, title];
@@ -68,7 +69,7 @@ impl DocumentTitleChangedObserver {
         .object
         .addObserver_forKeyPath_options_context(
           &observer,
-          ns_string!("title"),
+          &NSString::from_str("title"),
           NSKeyValueObservingOptions::New,
           null_mut(),
         );
@@ -84,7 +85,7 @@ impl Drop for DocumentTitleChangedObserver {
       self
         .ivars()
         .object
-        .removeObserver_forKeyPath(self, ns_string!("title"));
+        .removeObserver_forKeyPath(self, &NSString::from_str("title"));
     }
   }
 }

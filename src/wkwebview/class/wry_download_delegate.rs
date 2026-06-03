@@ -19,6 +19,7 @@ pub struct WryDownloadDelegateIvars {
 
 define_class!(
   #[unsafe(super(NSObject))]
+  #[name = "WryDownloadDelegate"]
   #[thread_kind = MainThreadOnly]
   #[ivars = WryDownloadDelegateIvars]
   pub struct WryDownloadDelegate;

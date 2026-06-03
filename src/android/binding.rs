@@ -14,11 +14,8 @@ pub use jni::{
   JNIEnv,
 };
 pub use ndk;
-use ndk::looper::{FdEvent, ThreadLooper};
-use std::os::fd::{AsFd, AsRawFd};
 
 use super::{
-  main_pipe::{MainPipe, MAIN_PIPE},
   ASSET_LOADER_DOMAIN, EVAL_CALLBACKS, IPC, ON_LOAD_HANDLER, REQUEST_HANDLER, TITLE_CHANGE_HANDLER,
   URL_LOADING_OVERRIDE, WITH_ASSET_LOADER,
 };
@@ -35,19 +32,12 @@ macro_rules! android_binding {
   ($domain:ident, $package:ident, $wry:path) => {{
     use $wry::{android_setup as _, prelude::*};
 
-    android_fn!($domain, $package, Rust, wryCreate, []);
-    android_fn!(
-      $domain,
-      $package,
-      Rust,
-      onWebviewDestroy,
-      [JObject, JString]
-    );
+    android_fn!($domain, $package, WryActivity, onActivityDestroy, [JObject]);
 
     android_fn!(
       $domain,
       $package,
-      Rust,
+      RustWebViewClient,
       handleRequest,
       [JString, JObject, jboolean],
       jobject
@@ -55,37 +45,57 @@ macro_rules! android_binding {
     android_fn!(
       $domain,
       $package,
-      Rust,
+      RustWebViewClient,
       withAssetLoader,
-      [JString],
+      [],
       jboolean
     );
     android_fn!(
       $domain,
       $package,
-      Rust,
+      RustWebViewClient,
       assetLoaderDomain,
-      [JString],
+      [],
       jstring
     );
     android_fn!(
       $domain,
       $package,
-      Rust,
+      RustWebViewClient,
       shouldOverride,
-      [JString, JString],
+      [JString],
       jboolean
     );
-    android_fn!($domain, $package, Rust, onEval, [JString, jint, JString]);
-    android_fn!($domain, $package, Rust, onPageLoading, [JString, JString]);
-    android_fn!($domain, $package, Rust, onPageLoaded, [JString, JString]);
-    android_fn!($domain, $package, Rust, ipc, [JString, JString, JString]);
     android_fn!(
       $domain,
       $package,
-      Rust,
+      RustWebView,
+      shouldOverride,
+      [JString],
+      jboolean
+    );
+    android_fn!($domain, $package, RustWebView, onEval, [jint, JString]);
+    android_fn!(
+      $domain,
+      $package,
+      RustWebViewClient,
+      onPageLoading,
+      [JString]
+    );
+    android_fn!(
+      $domain,
+      $package,
+      RustWebViewClient,
+      onPageLoaded,
+      [JString]
+    );
+    android_fn!($domain, $package, Ipc, ipc, [JString, JString]);
+    android_fn!(
+      $domain,
+      $package,
+      RustWebChromeClient,
       handleReceivedTitle,
-      [JString, JString],
+      [JObject, JString],
     );
   }};
 }
@@ -96,10 +106,7 @@ fn handle_request(
   request: JObject,
   is_document_start_script_enabled: jboolean,
 ) -> JniResult<jobject> {
-  let webview_id = env.get_string(&webview_id)?;
-  let webview_id = webview_id.to_str().ok().unwrap_or_default();
-
-  if let Some(handler) = REQUEST_HANDLER.lock().unwrap().get(webview_id) {
+  if let Some(handler) = REQUEST_HANDLER.lock().unwrap().as_ref() {
     #[cfg(feature = "tracing")]
     let span =
       tracing::info_span!(parent: None, "wry::custom_protocol::handle", uri = tracing::field::Empty).entered();
@@ -152,12 +159,15 @@ fn handle_request(
 
     let final_request = match request_builder.body(Vec::new()) {
       Ok(req) => req,
-      Err(_e) => {
+      Err(e) => {
         #[cfg(feature = "tracing")]
-        tracing::warn!("Failed to build response: {_e}");
+        tracing::warn!("Failed to build response: {}", e);
         return Ok(*JObject::null());
       }
     };
+
+    let webview_id = env.get_string(&webview_id)?;
+    let webview_id = webview_id.to_str().ok().unwrap_or_default();
 
     let response = {
       #[cfg(feature = "tracing")]
@@ -180,9 +190,9 @@ fn handle_request(
       } else {
         None
       };
-      if let Some(_err) = status_err {
+      if let Some(err) = status_err {
         #[cfg(feature = "tracing")]
-        tracing::warn!("{_err}");
+        tracing::warn!("{}", err);
         return Ok(*JObject::null());
       }
 
@@ -251,54 +261,8 @@ fn handle_request(
 }
 
 #[allow(non_snake_case)]
-pub unsafe fn wryCreate(env: JNIEnv, _: JClass) {
-  let mut main_pipe = MainPipe { env };
-
-  let looper = ThreadLooper::for_thread().unwrap();
-
-  looper
-    .add_fd_with_callback(MAIN_PIPE[0].as_fd(), FdEvent::INPUT, move |fd, _event| {
-      let size = std::mem::size_of::<bool>();
-      let mut wake = false;
-      if libc::read(fd.as_raw_fd(), &mut wake as *mut _ as *mut _, size) == size as libc::ssize_t {
-        // unregister itself on errors
-        main_pipe.recv().is_ok()
-      } else {
-        // unregister itself
-        false
-      }
-    })
-    .unwrap();
-}
-
-#[allow(non_snake_case)]
-pub unsafe fn onWebviewDestroy(mut env: JNIEnv, _: JClass, activity: JObject, webview_id: JString) {
-  let activity_id = env
-    .call_method(&activity, "getId", "()I", &[])
-    .unwrap()
-    .i()
-    .unwrap();
-
-  let webview_id = env
-    .get_string(&webview_id)
-    .unwrap()
-    .to_string_lossy()
-    .to_string();
-
-  let is_changing_configurations = env
-    .call_method(&activity, "isChangingConfigurations", "()Z", &[])
-    .unwrap()
-    .z()
-    .unwrap();
-
-  super::MainPipe::send(
-    activity_id,
-    super::WebViewMessage::OnDestroy {
-      activity_id,
-      webview_id,
-      is_changing_configurations,
-    },
-  );
+pub unsafe fn onActivityDestroy(_: JNIEnv, _: JClass, _: JObject) {
+  super::MainPipe::send(super::WebViewMessage::OnDestroy);
 }
 
 #[allow(non_snake_case)]
@@ -316,44 +280,33 @@ pub unsafe fn handleRequest(
     is_document_start_script_enabled,
   ) {
     Ok(response) => response,
-    Err(_e) => {
+    Err(e) => {
       #[cfg(feature = "tracing")]
-      tracing::warn!("Failed to handle request: {_e}");
+      tracing::warn!("Failed to handle request: {}", e);
       JObject::null().as_raw()
     }
   }
 }
 
 #[allow(non_snake_case)]
-pub unsafe fn shouldOverride(
-  mut env: JNIEnv,
-  _: JClass,
-  webview_id: JString,
-  url: JString,
-) -> jboolean {
+pub unsafe fn shouldOverride(mut env: JNIEnv, _: JClass, url: JString) -> jboolean {
   match env.get_string(&url) {
     Ok(url) => {
       let url = url.to_string_lossy().to_string();
-
-      let Ok(webview_id) = env.get_string(&webview_id) else {
-        return false.into();
-      };
-      let webview_id = webview_id.to_str().ok().unwrap_or_default();
-
       URL_LOADING_OVERRIDE
         .lock()
         .unwrap()
-        .get(webview_id)
+        .as_ref()
         // We negate the result of the function because the logic for the android
         // client is different from how the navigation_handler is defined.
         //
         // https://developer.android.com/reference/android/webkit/WebViewClient#shouldOverrideUrlLoading(android.webkit.WebView,%20android.webkit.WebResourceRequest)
         .map(|f| !(f.handler)(url))
-        .unwrap_or_default()
+        .unwrap_or(false)
     }
-    Err(_e) => {
+    Err(e) => {
       #[cfg(feature = "tracing")]
-      tracing::warn!("Failed to parse JString: {_e}");
+      tracing::warn!("Failed to parse JString: {}", e);
       false
     }
   }
@@ -361,7 +314,7 @@ pub unsafe fn shouldOverride(
 }
 
 #[allow(non_snake_case)]
-pub unsafe fn onEval(mut env: JNIEnv, _: JClass, _webview_id: JString, id: jint, result: JString) {
+pub unsafe fn onEval(mut env: JNIEnv, _: JClass, id: jint, result: JString) {
   match env.get_string(&result) {
     Ok(result) => {
       if let Some(cb) = EVAL_CALLBACKS
@@ -373,75 +326,56 @@ pub unsafe fn onEval(mut env: JNIEnv, _: JClass, _webview_id: JString, id: jint,
         cb(result.into());
       }
     }
-    Err(_e) => {
+    Err(e) => {
       #[cfg(feature = "tracing")]
-      tracing::warn!("Failed to parse JString: {_e}");
+      tracing::warn!("Failed to parse JString: {}", e);
     }
   }
 }
 
-pub unsafe fn ipc(mut env: JNIEnv, _: JClass, webview_id: JString, url: JString, body: JString) {
-  match (
-    env.get_string(&url),
-    env.get_string(&body),
-    env.get_string(&webview_id),
-  ) {
-    (Ok(url), Ok(body), Ok(webview_id)) => {
+pub unsafe fn ipc(mut env: JNIEnv, _: JClass, url: JString, body: JString) {
+  match (env.get_string(&url), env.get_string(&body)) {
+    (Ok(url), Ok(body)) => {
       #[cfg(feature = "tracing")]
       let _span = tracing::info_span!(parent: None, "wry::ipc::handle").entered();
 
       let url = url.to_string_lossy().to_string();
       let body = body.to_string_lossy().to_string();
-      let webview_id = webview_id.to_string_lossy().to_string();
-      if let Some(ipc) = IPC.lock().unwrap().get(&webview_id) {
+      if let Some(ipc) = IPC.lock().unwrap().as_ref() {
         (ipc.handler)(Request::builder().uri(url).body(body).unwrap())
       }
     }
-    (Err(_e), _, _) | (_, Err(_e), _) | (_, _, Err(_e)) => {
+    (Err(e), _) | (_, Err(e)) => {
       #[cfg(feature = "tracing")]
-      tracing::warn!("Failed to parse JString: {_e}")
+      tracing::warn!("Failed to parse JString: {}", e)
     }
   }
 }
 
 #[allow(non_snake_case)]
-pub unsafe fn handleReceivedTitle(mut env: JNIEnv, _: JClass, webview_id: JString, title: JString) {
-  match (env.get_string(&title), env.get_string(&webview_id)) {
-    (Ok(title), Ok(webview_id)) => {
+pub unsafe fn handleReceivedTitle(mut env: JNIEnv, _: JClass, _webview: JObject, title: JString) {
+  match env.get_string(&title) {
+    Ok(title) => {
       let title = title.to_string_lossy().to_string();
-      let webview_id = webview_id.to_string_lossy().to_string();
-      if let Some(title_handler) = TITLE_CHANGE_HANDLER.lock().unwrap().get(&webview_id) {
+      if let Some(title_handler) = TITLE_CHANGE_HANDLER.lock().unwrap().as_ref() {
         (title_handler.handler)(title)
       }
     }
-    (Err(_e), _) | (_, Err(_e)) => {
+    Err(e) => {
       #[cfg(feature = "tracing")]
-      tracing::warn!("Failed to parse JString: {_e}")
+      tracing::warn!("Failed to parse JString: {}", e)
     }
   }
 }
 
 #[allow(non_snake_case)]
-pub unsafe fn withAssetLoader(mut env: JNIEnv, _: JClass, webview_id: JString) -> jboolean {
-  let Ok(webview_id) = env.get_string(&webview_id) else {
-    return false.into();
-  };
-  let webview_id = webview_id.to_str().ok().unwrap_or_default();
-  (*WITH_ASSET_LOADER
-    .lock()
-    .unwrap()
-    .get(webview_id)
-    .unwrap_or(&false))
-  .into()
+pub unsafe fn withAssetLoader(_: JNIEnv, _: JClass) -> jboolean {
+  (*WITH_ASSET_LOADER.lock().unwrap().as_ref().unwrap_or(&false)).into()
 }
 
 #[allow(non_snake_case)]
-pub unsafe fn assetLoaderDomain(mut env: JNIEnv, _: JClass, webview_id: JString) -> jstring {
-  let Ok(webview_id) = env.get_string(&webview_id) else {
-    return env.new_string("wry.assets").unwrap().as_raw();
-  };
-  let webview_id = webview_id.to_str().ok().unwrap_or_default();
-  if let Some(domain) = ASSET_LOADER_DOMAIN.lock().unwrap().get(webview_id) {
+pub unsafe fn assetLoaderDomain(env: JNIEnv, _: JClass) -> jstring {
+  if let Some(domain) = ASSET_LOADER_DOMAIN.lock().unwrap().as_ref() {
     env.new_string(domain).unwrap().as_raw()
   } else {
     env.new_string("wry.assets").unwrap().as_raw()
@@ -449,35 +383,33 @@ pub unsafe fn assetLoaderDomain(mut env: JNIEnv, _: JClass, webview_id: JString)
 }
 
 #[allow(non_snake_case)]
-pub unsafe fn onPageLoading(mut env: JNIEnv, _: JClass, webview_id: JString, url: JString) {
-  match (env.get_string(&url), env.get_string(&webview_id)) {
-    (Ok(url), Ok(webview_id)) => {
+pub unsafe fn onPageLoading(mut env: JNIEnv, _: JClass, url: JString) {
+  match env.get_string(&url) {
+    Ok(url) => {
       let url = url.to_string_lossy().to_string();
-      let webview_id = webview_id.to_string_lossy().to_string();
-      if let Some(on_load) = ON_LOAD_HANDLER.lock().unwrap().get(&webview_id) {
+      if let Some(on_load) = ON_LOAD_HANDLER.lock().unwrap().as_ref() {
         (on_load.handler)(PageLoadEvent::Started, url)
       }
     }
-    (Err(_e), _) | (_, Err(_e)) => {
+    Err(e) => {
       #[cfg(feature = "tracing")]
-      tracing::warn!("Failed to parse JString: {_e}")
+      tracing::warn!("Failed to parse JString: {}", e)
     }
   }
 }
 
 #[allow(non_snake_case)]
-pub unsafe fn onPageLoaded(mut env: JNIEnv, _: JClass, webview_id: JString, url: JString) {
-  match (env.get_string(&url), env.get_string(&webview_id)) {
-    (Ok(url), Ok(webview_id)) => {
+pub unsafe fn onPageLoaded(mut env: JNIEnv, _: JClass, url: JString) {
+  match env.get_string(&url) {
+    Ok(url) => {
       let url = url.to_string_lossy().to_string();
-      let webview_id = webview_id.to_string_lossy().to_string();
-      if let Some(on_load) = ON_LOAD_HANDLER.lock().unwrap().get(&webview_id) {
+      if let Some(on_load) = ON_LOAD_HANDLER.lock().unwrap().as_ref() {
         (on_load.handler)(PageLoadEvent::Finished, url)
       }
     }
-    (Err(_e), _) | (_, Err(_e)) => {
+    Err(e) => {
       #[cfg(feature = "tracing")]
-      tracing::warn!("Failed to parse JString: {_e}")
+      tracing::warn!("Failed to parse JString: {}", e)
     }
   }
 }

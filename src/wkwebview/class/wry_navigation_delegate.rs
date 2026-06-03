@@ -41,6 +41,7 @@ pub struct WryNavigationDelegateIvars {
 
 define_class!(
   #[unsafe(super(NSObject))]
+  #[name = "WryNavigationDelegate"]
   #[thread_kind = MainThreadOnly]
   #[ivars = WryNavigationDelegateIvars]
   pub struct WryNavigationDelegate;

@@ -10,16 +10,19 @@ use http::{header::CONTENT_TYPE, HeaderName, HeaderValue, Request, Response as H
 use soup::{MessageHeaders, MessageHeadersType};
 use std::{
   borrow::Cow,
-  cell::RefCell,
+  cell::{Cell, RefCell},
   env::current_dir,
   path::{Path, PathBuf},
   rc::Rc,
 };
 use webkit2gtk::{
-  ApplicationInfo, AutomationSessionExt, CookiePersistentStorage, DownloadExt, SecurityManagerExt,
-  URIRequest, URIRequestExt, URISchemeRequest, URISchemeRequestExt, URISchemeResponse,
-  URISchemeResponseExt, WebContext, WebContextExt as Webkit2gtkContextExt, WebView, WebViewExt,
+  ApplicationInfo, AutomationSessionExt, Download, DownloadExt, SecurityManagerExt, URIRequest,
+  URIRequestExt, URIResponseExt, URISchemeRequestExt, URISchemeResponse, URISchemeResponseExt,
+  WebContext, WebContextExt as Webkit2gtkContextExt, WebView, WebViewExt,
 };
+
+const MAX_ACTIVE_DOWNLOADS: usize = 4;
+const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct WebContextImpl {
@@ -30,20 +33,16 @@ pub struct WebContextImpl {
 
 impl WebContextImpl {
   pub fn new(data_directory: Option<&Path>) -> Self {
-    use webkit2gtk::{CookieManagerExt, WebsiteDataManager, WebsiteDataManagerExt};
+    use webkit2gtk::{WebsiteDataManager, WebsiteDataManagerExt};
     let mut context_builder = WebContext::builder();
     if let Some(data_directory) = data_directory {
       let data_manager = WebsiteDataManager::builder()
-        // TODO: Consider taking a cache_directory so this can be in XDG_CACHE_HOME.
-        .base_cache_directory(data_directory.to_string_lossy())
         .base_data_directory(data_directory.to_string_lossy())
         .build();
-      if let Some(cookie_manager) = data_manager.cookie_manager() {
-        cookie_manager.set_persistent_storage(
-          &data_directory.join("cookies").to_string_lossy(),
-          CookiePersistentStorage::Text,
-        );
-      }
+      // Persist website data (IndexedDB/local storage/cache) under the app data
+      // directory, but keep cookies in-memory only on WebKitGTK. This avoids
+      // cross-session cookie retention without disabling the rest of the web data
+      // manager.
       context_builder = context_builder.website_data_manager(&data_manager);
     }
     let context = context_builder.build();
@@ -92,6 +91,53 @@ impl WebContextImpl {
     self
       .context
       .set_web_extensions_directory(&path.to_string_lossy());
+  }
+}
+
+fn active_download_limit_reached(active_downloads: usize) -> bool {
+  active_downloads >= MAX_ACTIVE_DOWNLOADS
+}
+
+fn download_content_length_exceeds_limit(content_length: u64) -> bool {
+  content_length > MAX_DOWNLOAD_BYTES
+}
+
+fn download_received_data_exceeds_limit(received_data_length: u64) -> bool {
+  received_data_length > MAX_DOWNLOAD_BYTES
+}
+
+fn release_download_slot(active_downloads: &Rc<Cell<usize>>, slot_released: &Rc<Cell<bool>>) {
+  if slot_released.replace(true) {
+    return;
+  }
+
+  active_downloads.set(active_downloads.get().saturating_sub(1));
+}
+
+fn cancel_download_if_response_too_large(
+  download: &Download,
+  active_downloads: &Rc<Cell<usize>>,
+  slot_released: &Rc<Cell<bool>>,
+) {
+  let exceeds_limit = download
+    .response()
+    .map(|response| download_content_length_exceeds_limit(response.content_length()))
+    .unwrap_or(false);
+
+  if exceeds_limit {
+    release_download_slot(active_downloads, slot_released);
+    download.cancel();
+  }
+}
+
+fn cancel_download_if_received_data_too_large(
+  download: &Download,
+  active_downloads: &Rc<Cell<usize>>,
+  slot_released: &Rc<Cell<bool>>,
+) {
+  if download_received_data_exceeds_limit(download.received_data_length()) {
+    release_download_slot(active_downloads, slot_released);
+    download.cancel();
   }
 }
 
@@ -215,31 +261,38 @@ impl WebContextExt for super::WebContext {
           }
         };
 
-        let request_ = MainThreadRequest(request.clone());
+        // GLib's channel API is deprecated in favor of async channels, but keeping it local here
+        // avoids adding a new dependency to the vendored Wry fork for this safety fix.
+        #[allow(deprecated)]
+        let (response_sender, response_receiver) =
+          MainContext::channel::<HttpResponse<Cow<'static, [u8]>>>(glib::Priority::default());
+        let main_thread_request = request.clone();
+        response_receiver.attach(Some(&MainContext::default()), move |http_response| {
+          let buffer = http_response.body();
+          let input = gtk::gio::MemoryInputStream::from_bytes(&gtk::glib::Bytes::from(buffer));
+          let content_type = http_response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|h| h.to_str().ok());
+
+          let response = URISchemeResponse::new(&input, buffer.len() as i64);
+          response.set_status(http_response.status().as_u16() as u32, None);
+          if let Some(content_type) = content_type {
+            response.set_content_type(content_type);
+          }
+
+          let headers = MessageHeaders::new(MessageHeadersType::Response);
+          for (name, value) in http_response.headers().into_iter() {
+            headers.append(name.as_str(), value.to_str().unwrap_or(""));
+          }
+          response.set_http_headers(headers);
+          main_thread_request.finish_with_response(&response);
+
+          glib::ControlFlow::Break
+        });
         let responder: Box<dyn FnOnce(HttpResponse<Cow<'static, [u8]>>)> =
           Box::new(move |http_response| {
-            MainContext::default().invoke(move || {
-              let buffer = http_response.body();
-              let input = gtk::gio::MemoryInputStream::from_bytes(&gtk::glib::Bytes::from(buffer));
-              let content_type = http_response
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|h| h.to_str().ok());
-
-              let response = URISchemeResponse::new(&input, buffer.len() as i64);
-              response.set_status(http_response.status().as_u16() as u32, None);
-              if let Some(content_type) = content_type {
-                response.set_content_type(content_type);
-              }
-
-              let headers = MessageHeaders::new(MessageHeadersType::Response);
-              for (name, value) in http_response.headers().into_iter() {
-                headers.append(name.as_str(), value.to_str().unwrap_or(""));
-              }
-              response.set_http_headers(headers);
-              request_.finish_with_response(&response);
-            });
-
+            let _ = response_sender.send(http_response);
           });
 
         #[cfg(feature = "tracing")]
@@ -312,68 +365,112 @@ impl WebContextExt for super::WebContext {
     let context = &self.os.context;
 
     let download_started_handler = Rc::new(RefCell::new(download_started_handler));
-    let failed = Rc::new(RefCell::new(false));
+    let active_downloads = Rc::new(Cell::new(0usize));
 
     context.connect_download_started(move |_context, download| {
+      if active_download_limit_reached(active_downloads.get()) {
+        download.cancel();
+        return;
+      }
+
+      active_downloads.set(active_downloads.get().saturating_add(1));
+
       let download_started_handler = download_started_handler.clone();
-      download.connect_decide_destination(move |download, suggested_filename| {
-        if let Some(uri) = download.request().and_then(|req| req.uri()) {
-          let uri = uri.to_string();
+      let active_downloads = active_downloads.clone();
+      let failed = Rc::new(RefCell::new(false));
+      let slot_released = Rc::new(Cell::new(false));
 
-          if let Some(download_started_handler) = download_started_handler.borrow_mut().as_mut() {
-            let mut download_destination =
-              dirs::download_dir().unwrap_or_else(|| current_dir().unwrap_or_default());
+      download.connect_response_notify({
+        let active_downloads = active_downloads.clone();
+        let slot_released = slot_released.clone();
+        move |download| {
+          cancel_download_if_response_too_large(download, &active_downloads, &slot_released);
+        }
+      });
 
-            let (mut suggested_filename, ext) = suggested_filename
-              .split_once('.')
-              .map(|(base, ext)| (base, format!(".{ext}")))
-              .unwrap_or((suggested_filename, "".to_string()));
+      download.connect_received_data({
+        let active_downloads = active_downloads.clone();
+        let slot_released = slot_released.clone();
+        move |download, _chunk_len| {
+          cancel_download_if_received_data_too_large(download, &active_downloads, &slot_released);
+        }
+      });
 
-            // For `data:` downloads, webkitgtk will suggest to use the raw data as the filename if the dev provided no name,
-            // for example `"data:attachment/text,sometext"` will result in `text,sometext` but longer data URLs will
-            // result in a cut-off filename, which makes it hard to predict reliably.
-            // TODO: If this keeps causing problems, just remove it and use whatever file name webkitgtk suggests.
-            if uri.starts_with("data:") {
-              if let Some((_, uri_stripped)) = uri.split_once('/') {
-                if let Some((uri_stripped, _)) = uri_stripped.split_once(',') {
-                  if suggested_filename.starts_with(&format!("{uri_stripped},")) {
-                    suggested_filename = "Unknown";
+      download.connect_decide_destination({
+        let active_downloads = active_downloads.clone();
+        let slot_released = slot_released.clone();
+        move |download, suggested_filename| {
+          if let Some(uri) = download.request().and_then(|req| req.uri()) {
+            let uri = uri.to_string();
+
+            if let Some(download_started_handler) = download_started_handler.borrow_mut().as_mut() {
+              let mut download_destination =
+                dirs::download_dir().unwrap_or_else(|| current_dir().unwrap_or_default());
+
+              let (mut suggested_filename, ext) = suggested_filename
+                .split_once('.')
+                .map(|(base, ext)| (base, format!(".{ext}")))
+                .unwrap_or((suggested_filename, "".to_string()));
+
+              // For `data:` downloads, webkitgtk will suggest to use the raw data as the filename if the dev provided no name,
+              // for example `"data:attachment/text,sometext"` will result in `text,sometext` but longer data URLs will
+              // result in a cut-off filename, which makes it hard to predict reliably.
+              // TODO: If this keeps causing problems, just remove it and use whatever file name webkitgtk suggests.
+              if uri.starts_with("data:") {
+                if let Some((_, uri_stripped)) = uri.split_once('/') {
+                  if let Some((uri_stripped, _)) = uri_stripped.split_once(',') {
+                    if suggested_filename.starts_with(&format!("{uri_stripped},")) {
+                      suggested_filename = "Unknown";
+                    }
                   }
                 }
               }
-            }
 
-            download_destination.push(format!("{suggested_filename}{ext}"));
+              download_destination.push(format!("{suggested_filename}{ext}"));
 
-            // WebView2 does not overwrite files but appends numbers
-            let mut counter = 1;
-            while download_destination.exists() {
-              download_destination.set_file_name(format!("{suggested_filename} ({counter}){ext}"));
-              counter += 1;
-            }
+              // WebView2 does not overwrite files but appends numbers
+              let mut counter = 1;
+              while download_destination.exists() {
+                download_destination
+                  .set_file_name(format!("{suggested_filename} ({counter}){ext}"));
+                counter += 1;
+              }
 
-            if download_started_handler(uri, &mut download_destination) {
-              download.set_destination(&download_destination.to_string_lossy());
-            } else {
-              download.cancel();
+              cancel_download_if_response_too_large(download, &active_downloads, &slot_released);
+              if slot_released.get() {
+                return true;
+              }
+
+              if download_started_handler(uri, &mut download_destination) {
+                download.set_destination(&download_destination.to_string_lossy());
+              } else {
+                release_download_slot(&active_downloads, &slot_released);
+                download.cancel();
+              }
             }
           }
+          // TODO: check if we may also need `false`
+          true
         }
-        // TODO: check if we may also need `false`
-        true
       });
 
       download.connect_failed({
         let failed = failed.clone();
+        let active_downloads = active_downloads.clone();
+        let slot_released = slot_released.clone();
         move |_, _error| {
           *failed.borrow_mut() = true;
+          release_download_slot(&active_downloads, &slot_released);
         }
       });
 
       if let Some(download_completed_handler) = download_completed_handler.clone() {
         download.connect_finished({
           let failed = failed.clone();
+          let active_downloads = active_downloads.clone();
+          let slot_released = slot_released.clone();
           move |download| {
+            release_download_slot(&active_downloads, &slot_released);
             if let Some(uri) = download.request().and_then(|req| req.uri()) {
               let failed = *failed.borrow();
               let uri = uri.to_string();
@@ -392,13 +489,37 @@ impl WebContextExt for super::WebContext {
   }
 }
 
-struct MainThreadRequest(URISchemeRequest);
+#[cfg(test)]
+mod tests {
+  use super::*;
 
-impl MainThreadRequest {
-  fn finish_with_response(&self, response: &URISchemeResponse) {
-    self.0.finish_with_response(response);
+  #[test]
+  fn download_active_limit_rejects_fifth_parallel_download() {
+    assert!(!active_download_limit_reached(0));
+    assert!(!active_download_limit_reached(MAX_ACTIVE_DOWNLOADS - 1));
+    assert!(active_download_limit_reached(MAX_ACTIVE_DOWNLOADS));
+  }
+
+  #[test]
+  fn download_size_limits_allow_unknown_or_small_sizes_only() {
+    assert!(!download_content_length_exceeds_limit(0));
+    assert!(!download_content_length_exceeds_limit(MAX_DOWNLOAD_BYTES));
+    assert!(download_content_length_exceeds_limit(
+      MAX_DOWNLOAD_BYTES + 1
+    ));
+    assert!(!download_received_data_exceeds_limit(MAX_DOWNLOAD_BYTES));
+    assert!(download_received_data_exceeds_limit(MAX_DOWNLOAD_BYTES + 1));
+  }
+
+  #[test]
+  fn release_download_slot_is_idempotent() {
+    let active_downloads = Rc::new(Cell::new(1usize));
+    let slot_released = Rc::new(Cell::new(false));
+
+    release_download_slot(&active_downloads, &slot_released);
+    assert_eq!(active_downloads.get(), 0);
+
+    release_download_slot(&active_downloads, &slot_released);
+    assert_eq!(active_downloads.get(), 0);
   }
 }
-
-unsafe impl Send for MainThreadRequest {}
-unsafe impl Sync for MainThreadRequest {}

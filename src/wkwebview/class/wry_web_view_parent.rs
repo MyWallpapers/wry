@@ -20,6 +20,7 @@ pub struct WryWebViewParentIvars {
 
 define_class!(
   #[unsafe(super(NSView))]
+  #[name = "WryWebViewParent"]
   #[ivars = WryWebViewParentIvars]
   pub struct WryWebViewParent;
 
@@ -48,7 +49,6 @@ define_class!(
 );
 
 impl WryWebViewParent {
-  #[allow(dead_code)]
   pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
     let delegate = WryWebViewParent::alloc(mtm).set_ivars(WryWebViewParentIvars {
       #[cfg(target_os = "macos")]

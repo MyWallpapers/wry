@@ -4,7 +4,9 @@ use gtk::{
   gdk::{EventButton, EventMask, ModifierType},
   prelude::*,
 };
-use webkit2gtk::{WebView, WebViewExt};
+use webkit2gtk::WebView;
+
+use super::run_javascript_without_result;
 
 pub fn setup(webview: &WebView) {
   webview.add_events(EventMask::BUTTON1_MOTION_MASK | EventMask::BUTTON_PRESS_MASK);
@@ -14,26 +16,17 @@ pub fn setup(webview: &WebView) {
   let bf_state_c = bf_state.clone();
   webview.connect_button_press_event(move |webview, event| {
     let mut inhibit = false;
+    // Intercept back/forward mouse buttons so WebKit receives a synthetic event.
     match event.button() {
-      // back button
       8 => {
         inhibit = true;
         bf_state_c.set(BACK);
-        webview.run_javascript(
-          &create_js_mouse_event(event, true, &bf_state_c),
-          None::<&gtk::gio::Cancellable>,
-          |_| {},
-        );
+        run_javascript_without_result(webview, &create_js_mouse_event(event, true, &bf_state_c));
       }
-      // forward button
       9 => {
         inhibit = true;
         bf_state_c.set(FORWARD);
-        webview.run_javascript(
-          &create_js_mouse_event(event, true, &bf_state_c),
-          None::<&gtk::gio::Cancellable>,
-          |_| {},
-        );
+        run_javascript_without_result(webview, &create_js_mouse_event(event, true, &bf_state_c));
       }
       _ => {}
     }
@@ -49,25 +42,15 @@ pub fn setup(webview: &WebView) {
   webview.connect_button_release_event(move |webview, event| {
     let mut inhibit = false;
     match event.button() {
-      // back button
       8 => {
         inhibit = true;
         bf_state_c.remove(BACK);
-        webview.run_javascript(
-          &create_js_mouse_event(event, false, &bf_state_c),
-          None::<&gtk::gio::Cancellable>,
-          |_| {},
-        );
+        run_javascript_without_result(webview, &create_js_mouse_event(event, false, &bf_state_c));
       }
-      // forward button
       9 => {
         inhibit = true;
         bf_state_c.remove(FORWARD);
-        webview.run_javascript(
-          &create_js_mouse_event(event, false, &bf_state_c),
-          None::<&gtk::gio::Cancellable>,
-          |_| {},
-        );
+        run_javascript_without_result(webview, &create_js_mouse_event(event, false, &bf_state_c));
       }
       _ => {}
     }
