@@ -1701,7 +1701,7 @@ impl Default for PlatformSpecificWebViewAttributes {
       browser_extensions_enabled: false,
       extension_path: None,
       environment: None,
-      composition_mode: true,
+      composition_mode: false,
     }
   }
 }
