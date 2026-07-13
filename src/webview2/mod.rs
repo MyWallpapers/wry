@@ -61,6 +61,7 @@ pub(crate) struct InnerWebView {
   pub controller: ICoreWebView2Controller,
   pub webview: ICoreWebView2,
   pub env: ICoreWebView2Environment,
+  desktop_composition: Option<crate::desktop_composition::DesktopCompositionRegistration>,
   // Store FileDropController in here to make sure it gets dropped when
   // the webview gets dropped, otherwise we'll have a memory leak
   #[allow(dead_code)]
@@ -69,6 +70,7 @@ pub(crate) struct InnerWebView {
 
 impl Drop for InnerWebView {
   fn drop(&mut self) {
+    drop(self.desktop_composition.take());
     let _ = unsafe { self.controller.Close() };
     if self.is_child {
       let _ = unsafe { DestroyWindow(self.hwnd) };
@@ -135,7 +137,22 @@ impl InnerWebView {
     } else {
       Self::create_environment(&attributes, pl_attrs.clone())?
     };
-    let controller = Self::create_controller(hwnd, &env, attributes.incognito, background_color)?;
+    let desktop_composition =
+      if crate::desktop_composition::composition_mode_enabled_for_webview_id(&id)? {
+        Some(crate::desktop_composition::prepare_desktop_composition(
+          hwnd,
+          &env,
+          attributes.incognito,
+          background_color,
+        )?)
+      } else {
+        None
+      };
+    let controller = if let Some(composition) = desktop_composition.as_ref() {
+      composition.controller().clone()
+    } else {
+      Self::create_controller(hwnd, &env, attributes.incognito, background_color)?
+    };
     let webview = Self::init_webview(
       parent,
       hwnd,
@@ -157,7 +174,7 @@ impl InnerWebView {
       DragDropController::new(hwnd, handler)
     });
 
-    let w = Self {
+    let mut w = Self {
       id,
       parent: RefCell::new(parent),
       hwnd,
@@ -165,6 +182,7 @@ impl InnerWebView {
       is_child,
       webview,
       env,
+      desktop_composition: None,
       drag_drop_controller,
     };
 
@@ -172,6 +190,10 @@ impl InnerWebView {
       w.set_bounds(bounds.unwrap_or_default())?;
     } else {
       w.resize_to_parent()?;
+    }
+
+    if let Some(composition) = desktop_composition {
+      w.desktop_composition = Some(composition.register()?);
     }
 
     Ok(w)

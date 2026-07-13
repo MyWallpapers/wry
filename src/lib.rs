@@ -393,7 +393,16 @@ use wkwebview::*;
 pub use wkwebview::{PrintMargin, PrintOptions, WryWebView};
 
 #[cfg(target_os = "windows")]
+mod desktop_composition;
+#[cfg(target_os = "windows")]
 pub(crate) mod webview2;
+#[cfg(target_os = "windows")]
+pub use self::desktop_composition::{
+  desktop_composition_is_attached_to_hwnd, desktop_composition_ready_for_hwnd,
+  detach_desktop_composition_for_hwnd, enable_composition_mode_for_webview_id,
+  retarget_desktop_composition_for_hwnd, set_desktop_composition_bounds_for_hwnd,
+  DesktopCompositionError,
+};
 #[cfg(target_os = "windows")]
 pub use self::webview2::ScrollBarStyle;
 #[cfg(target_os = "windows")]

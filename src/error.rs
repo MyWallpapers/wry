@@ -40,6 +40,9 @@ pub enum Error {
   #[cfg(target_os = "windows")]
   #[error("WebView2 error: {0}")]
   WebView2Error(webview2_com::Error),
+  #[cfg(target_os = "windows")]
+  #[error(transparent)]
+  DesktopComposition(#[from] crate::DesktopCompositionError),
   #[error(transparent)]
   HttpError(#[from] http::Error),
   #[error("Infallible error, something went really wrong: {0}")]
