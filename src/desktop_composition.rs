@@ -74,7 +74,8 @@ struct DesktopCompositionState {
   controller: ICoreWebView2CompositionController,
   device: IDCompositionDevice,
   parking_target: IDCompositionTarget,
-  visual: IDCompositionVisual,
+  target_root_visual: IDCompositionVisual,
+  _webview_visual: IDCompositionVisual,
   presentation_target: Option<IDCompositionTarget>,
   presentation_hwnd: isize,
   owner_thread: u32,
@@ -221,9 +222,17 @@ pub(crate) fn prepare_desktop_composition(
     unsafe { DCompositionCreateDevice2(None) }.map_err(as_wry_error)?;
   let parking_target =
     unsafe { device.CreateTargetForHwnd(controller_hwnd, true) }.map_err(as_wry_error)?;
-  let visual = unsafe { device.CreateVisual() }.map_err(as_wry_error)?;
-  unsafe { parking_target.SetRoot(&visual) }.map_err(as_wry_error)?;
-  let visual_unknown: windows::core::IUnknown = visual.cast().map_err(as_wry_error)?;
+  // WebView2 connects its private visual tree to an application-owned child
+  // visual. Keep that visual distinct from the target root, matching the
+  // composition-controller contract and Microsoft's reference host. Using
+  // the target root itself as RootVisualTarget leaves the WebView tree
+  // disconnected on current WebView2 runtimes and presents only the HWND
+  // background.
+  let target_root_visual = unsafe { device.CreateVisual() }.map_err(as_wry_error)?;
+  unsafe { parking_target.SetRoot(&target_root_visual) }.map_err(as_wry_error)?;
+  let webview_visual = unsafe { device.CreateVisual() }.map_err(as_wry_error)?;
+  unsafe { target_root_visual.AddVisual(&webview_visual, true, None) }.map_err(as_wry_error)?;
+  let visual_unknown: windows::core::IUnknown = webview_visual.cast().map_err(as_wry_error)?;
   unsafe { composition_controller.SetRootVisualTarget(&visual_unknown) }.map_err(as_wry_error)?;
   unsafe { device.Commit() }.map_err(as_wry_error)?;
 
@@ -234,7 +243,8 @@ pub(crate) fn prepare_desktop_composition(
       controller: composition_controller,
       device,
       parking_target,
-      visual,
+      target_root_visual,
+      _webview_visual: webview_visual,
       presentation_target: None,
       presentation_hwnd: 0,
       owner_thread: unsafe { GetCurrentThreadId() },
@@ -332,7 +342,7 @@ unsafe fn restore_visual(
   previous_target: &IDCompositionTarget,
 ) -> windows::core::Result<()> {
   attempted_target.SetRoot(None::<&IDCompositionVisual>)?;
-  previous_target.SetRoot(&state.visual)?;
+  previous_target.SetRoot(&state.target_root_visual)?;
   state.device.Commit()
 }
 
@@ -391,7 +401,7 @@ pub fn retarget_desktop_composition_for_hwnd(
       })?;
 
     if let Err(error) = target
-      .SetRoot(&state.visual)
+      .SetRoot(&state.target_root_visual)
       .and_then(|()| state.device.Commit())
     {
       return Err(transition_error(
@@ -429,7 +439,7 @@ pub fn detach_desktop_composition_for_hwnd(
       })?;
     if let Err(error) = state
       .parking_target
-      .SetRoot(&state.visual)
+      .SetRoot(&state.target_root_visual)
       .and_then(|()| state.device.Commit())
     {
       return Err(transition_error(
