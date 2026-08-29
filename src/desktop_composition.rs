@@ -72,6 +72,7 @@ impl std::error::Error for DesktopCompositionError {}
 
 struct DesktopCompositionState {
   controller: ICoreWebView2CompositionController,
+  controller_hwnd: HWND,
   device: IDCompositionDevice,
   parking_target: IDCompositionTarget,
   target_root_visual: IDCompositionVisual,
@@ -241,6 +242,7 @@ pub(crate) fn prepare_desktop_composition(
     controller,
     state: DesktopCompositionState {
       controller: composition_controller,
+      controller_hwnd,
       device,
       parking_target,
       target_root_visual,
@@ -340,9 +342,12 @@ unsafe fn restore_visual(
   state: &DesktopCompositionState,
   attempted_target: &IDCompositionTarget,
   previous_target: &IDCompositionTarget,
+  previous_parent: HWND,
 ) -> windows::core::Result<()> {
   attempted_target.SetRoot(None::<&IDCompositionVisual>)?;
   previous_target.SetRoot(&state.target_root_visual)?;
+  state.controller.SetParentWindow(previous_parent)?;
+  state.controller.NotifyParentWindowPositionChanged()?;
   state.device.Commit()
 }
 
@@ -379,6 +384,22 @@ pub fn retarget_desktop_composition_for_hwnd(
     if state.presentation_hwnd == presentation_hwnd.0 as isize
       && state.presentation_target.is_some()
     {
+      state
+        .controller
+        .SetParentWindow(presentation_hwnd)
+        .map_err(|error| {
+          DesktopCompositionError::OperationFailed(format!(
+            "refreshing the WebView2 presentation parent failed: {error}"
+          ))
+        })?;
+      state
+        .controller
+        .NotifyParentWindowPositionChanged()
+        .map_err(|error| {
+          DesktopCompositionError::OperationFailed(format!(
+            "refreshing the WebView2 presentation position failed: {error}"
+          ))
+        })?;
       return Ok(());
     }
 
@@ -392,6 +413,11 @@ pub fn retarget_desktop_composition_for_hwnd(
       .presentation_target
       .clone()
       .unwrap_or_else(|| state.parking_target.clone());
+    let previous_parent = state.controller.ParentWindow().map_err(|error| {
+      DesktopCompositionError::OperationFailed(format!(
+        "reading the previous WebView2 parent window failed: {error}"
+      ))
+    })?;
     previous_target
       .SetRoot(None::<&IDCompositionVisual>)
       .map_err(|error| {
@@ -400,14 +426,16 @@ pub fn retarget_desktop_composition_for_hwnd(
         ))
       })?;
 
-    if let Err(error) = target
+    let transition = target
       .SetRoot(&state.target_root_visual)
-      .and_then(|()| state.device.Commit())
-    {
+      .and_then(|()| state.controller.SetParentWindow(presentation_hwnd))
+      .and_then(|()| state.controller.NotifyParentWindowPositionChanged())
+      .and_then(|()| state.device.Commit());
+    if let Err(error) = transition {
       return Err(transition_error(
         "attaching the presentation target failed",
         error,
-        restore_visual(state, &target, &previous_target),
+        restore_visual(state, &target, &previous_target, previous_parent),
       ));
     }
 
@@ -426,10 +454,31 @@ pub fn detach_desktop_composition_for_hwnd(
 ) -> Result<(), DesktopCompositionError> {
   with_state_mut(controller_hwnd, |state| unsafe {
     let Some(previous_target) = state.presentation_target.clone() else {
+      state
+        .controller
+        .SetParentWindow(state.controller_hwnd)
+        .map_err(|error| {
+          DesktopCompositionError::OperationFailed(format!(
+            "restoring the WebView2 controller parent failed: {error}"
+          ))
+        })?;
+      state
+        .controller
+        .NotifyParentWindowPositionChanged()
+        .map_err(|error| {
+          DesktopCompositionError::OperationFailed(format!(
+            "refreshing the WebView2 controller position failed: {error}"
+          ))
+        })?;
       state.presentation_hwnd = 0;
       return Ok(());
     };
 
+    let previous_parent = state.controller.ParentWindow().map_err(|error| {
+      DesktopCompositionError::OperationFailed(format!(
+        "reading the previous WebView2 parent window failed: {error}"
+      ))
+    })?;
     previous_target
       .SetRoot(None::<&IDCompositionVisual>)
       .map_err(|error| {
@@ -437,15 +486,22 @@ pub fn detach_desktop_composition_for_hwnd(
           "detaching the presentation target failed: {error}"
         ))
       })?;
-    if let Err(error) = state
+    let transition = state
       .parking_target
       .SetRoot(&state.target_root_visual)
-      .and_then(|()| state.device.Commit())
-    {
+      .and_then(|()| state.controller.SetParentWindow(state.controller_hwnd))
+      .and_then(|()| state.controller.NotifyParentWindowPositionChanged())
+      .and_then(|()| state.device.Commit());
+    if let Err(error) = transition {
       return Err(transition_error(
         "restoring the parking target failed",
         error,
-        restore_visual(state, &state.parking_target, &previous_target),
+        restore_visual(
+          state,
+          &state.parking_target,
+          &previous_target,
+          previous_parent,
+        ),
       ));
     }
 
@@ -460,10 +516,16 @@ pub fn desktop_composition_is_attached_to_hwnd(
   controller_hwnd: HWND,
   presentation_hwnd: HWND,
 ) -> Result<bool, DesktopCompositionError> {
-  with_state(controller_hwnd, |state| {
+  with_state(controller_hwnd, |state| unsafe {
+    let parent = state.controller.ParentWindow().map_err(|error| {
+      DesktopCompositionError::OperationFailed(format!(
+        "reading the WebView2 presentation parent failed: {error}"
+      ))
+    })?;
     Ok(
       state.presentation_hwnd == presentation_hwnd.0 as isize
-        && state.presentation_target.is_some(),
+        && state.presentation_target.is_some()
+        && parent == presentation_hwnd,
     )
   })
 }
