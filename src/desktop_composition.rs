@@ -11,8 +11,8 @@ use once_cell::sync::Lazy;
 use webview2_com::{
   CreateCoreWebView2CompositionControllerCompletedHandler,
   Microsoft::Web::WebView2::Win32::{
-    ICoreWebView2CompositionController, ICoreWebView2Controller, ICoreWebView2ControllerOptions3,
-    ICoreWebView2Environment, ICoreWebView2Environment10, COREWEBVIEW2_COLOR,
+    ICoreWebView2Controller, ICoreWebView2ControllerOptions3, ICoreWebView2Environment,
+    ICoreWebView2Environment10, COREWEBVIEW2_COLOR,
   },
 };
 use windows::{
@@ -71,7 +71,7 @@ impl fmt::Display for DesktopCompositionError {
 impl std::error::Error for DesktopCompositionError {}
 
 struct DesktopCompositionState {
-  controller: ICoreWebView2CompositionController,
+  controller: ICoreWebView2Controller,
   controller_hwnd: HWND,
   device: IDCompositionDevice,
   parking_target: IDCompositionTarget,
@@ -239,9 +239,9 @@ pub(crate) fn prepare_desktop_composition(
 
   Ok(PreparedDesktopComposition {
     controller_hwnd: controller_hwnd.0 as isize,
-    controller,
+    controller: controller.clone(),
     state: DesktopCompositionState {
-      controller: composition_controller,
+      controller,
       controller_hwnd,
       device,
       parking_target,
@@ -351,6 +351,12 @@ unsafe fn restore_visual(
   state.device.Commit()
 }
 
+unsafe fn parent_window(controller: &ICoreWebView2Controller) -> windows::core::Result<HWND> {
+  let mut parent = HWND::default();
+  controller.ParentWindow(&mut parent)?;
+  Ok(parent)
+}
+
 fn transition_error(
   operation: &str,
   original: windows::core::Error,
@@ -413,7 +419,7 @@ pub fn retarget_desktop_composition_for_hwnd(
       .presentation_target
       .clone()
       .unwrap_or_else(|| state.parking_target.clone());
-    let previous_parent = state.controller.ParentWindow().map_err(|error| {
+    let previous_parent = parent_window(&state.controller).map_err(|error| {
       DesktopCompositionError::OperationFailed(format!(
         "reading the previous WebView2 parent window failed: {error}"
       ))
@@ -474,7 +480,7 @@ pub fn detach_desktop_composition_for_hwnd(
       return Ok(());
     };
 
-    let previous_parent = state.controller.ParentWindow().map_err(|error| {
+    let previous_parent = parent_window(&state.controller).map_err(|error| {
       DesktopCompositionError::OperationFailed(format!(
         "reading the previous WebView2 parent window failed: {error}"
       ))
@@ -517,7 +523,7 @@ pub fn desktop_composition_is_attached_to_hwnd(
   presentation_hwnd: HWND,
 ) -> Result<bool, DesktopCompositionError> {
   with_state(controller_hwnd, |state| unsafe {
-    let parent = state.controller.ParentWindow().map_err(|error| {
+    let parent = parent_window(&state.controller).map_err(|error| {
       DesktopCompositionError::OperationFailed(format!(
         "reading the WebView2 presentation parent failed: {error}"
       ))
@@ -542,12 +548,8 @@ pub fn set_desktop_composition_bounds_for_hwnd(
     ));
   }
   with_state(controller_hwnd, |state| unsafe {
-    let controller: ICoreWebView2Controller = state.controller.cast().map_err(|error| {
-      DesktopCompositionError::OperationFailed(format!(
-        "querying ICoreWebView2Controller failed: {error}"
-      ))
-    })?;
-    controller
+    state
+      .controller
       .SetBounds(RECT {
         left: 0,
         top: 0,
@@ -557,7 +559,8 @@ pub fn set_desktop_composition_bounds_for_hwnd(
       .map_err(|error| {
         DesktopCompositionError::OperationFailed(format!("SetBounds failed: {error}"))
       })?;
-    controller
+    state
+      .controller
       .NotifyParentWindowPositionChanged()
       .map_err(|error| {
         DesktopCompositionError::OperationFailed(format!(
